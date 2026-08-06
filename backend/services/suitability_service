@@ -1,0 +1,140 @@
+from math import cos, radians, sin
+
+from schemas.suitability import (
+    DeploymentRecommendation,
+    EnvironmentalInputs,
+    EnvironmentalSummary,
+    SuitabilityAnalyzeRequest,
+    SuitabilityAnalyzeResponse,
+)
+
+
+RECENT_ANALYSES: list[dict] = []
+
+
+def clamp(value: float, minimum: float = 0, maximum: float = 100) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def scale(value: float, low: float, high: float) -> float:
+    if high == low:
+        return 0
+    return clamp(((value - low) / (high - low)) * 100)
+
+
+def derive_environmental_data(latitude: float, longitude: float) -> EnvironmentalSummary:
+    lat_factor = abs(latitude) / 90
+    lon_wave = (sin(radians(longitude)) + 1) / 2
+    lat_wave = (cos(radians(latitude)) + 1) / 2
+
+    return EnvironmentalSummary(
+        solar_irradiance=round(4.1 + (lat_wave * 2.2) - (lat_factor * 0.7), 2),
+        wind_speed=round(3.8 + (lon_wave * 4.4) + (lat_factor * 1.2), 2),
+        temperature=round(18 + (lat_wave * 14), 1),
+        rainfall=round(35 + (lon_wave * 95), 1),
+        elevation=round(45 + (lat_factor * 780) + (lon_wave * 160), 1),
+        land_slope=round(1.5 + (lat_factor * 7.5) + ((1 - lon_wave) * 3), 1),
+    )
+
+
+def merge_environmental_data(
+    latitude: float,
+    longitude: float,
+    supplied: EnvironmentalInputs | None,
+) -> EnvironmentalSummary:
+    baseline = derive_environmental_data(latitude, longitude)
+    if supplied is None:
+        return baseline
+
+    values = baseline.model_dump()
+    for field, value in supplied.model_dump(exclude_none=True).items():
+        values[field] = value
+    return EnvironmentalSummary(**values)
+
+
+def score_solar(data: EnvironmentalSummary) -> int:
+    irradiance = scale(data.solar_irradiance, 3.5, 6.8)
+    temperature = 100 - clamp(abs(data.temperature - 26) * 4)
+    rainfall = 100 - scale(data.rainfall, 60, 220)
+    slope = 100 - scale(data.land_slope, 5, 16)
+    elevation = 100 - scale(data.elevation, 1200, 2400)
+    score = (irradiance * 0.45) + (temperature * 0.18) + (rainfall * 0.16) + (slope * 0.14) + (elevation * 0.07)
+    return round(clamp(score))
+
+
+def score_wind(data: EnvironmentalSummary) -> int:
+    wind = scale(data.wind_speed, 3, 9.5)
+    slope = 100 - scale(data.land_slope, 8, 20)
+    elevation = clamp(62 + scale(data.elevation, 80, 900) * 0.38)
+    rainfall = 100 - scale(data.rainfall, 120, 260) * 0.45
+    temperature = 100 - clamp(abs(data.temperature - 23) * 2.4)
+    score = (wind * 0.52) + (slope * 0.15) + (elevation * 0.14) + (rainfall * 0.10) + (temperature * 0.09)
+    return round(clamp(score))
+
+
+def get_category(overall_score: int) -> str:
+    if overall_score >= 90:
+        return "Excellent"
+    if overall_score >= 80:
+        return "Highly Suitable"
+    if overall_score >= 65:
+        return "Moderately Suitable"
+    if overall_score >= 45:
+        return "Low Suitability"
+    return "Unsuitable"
+
+
+def recommend_deployment(solar_score: int, wind_score: int, overall_score: int) -> DeploymentRecommendation:
+    if solar_score >= 78 and wind_score >= 78:
+        recommendation = "Hybrid Solar + Wind"
+        reason = "High solar irradiance and strong wind availability"
+    elif solar_score >= wind_score + 8:
+        recommendation = "Solar Farm"
+        reason = "Solar resource quality is stronger than wind availability"
+    elif wind_score >= solar_score + 8:
+        recommendation = "Wind Farm"
+        reason = "Wind availability is stronger than solar resource quality"
+    else:
+        recommendation = "Hybrid Solar + Wind"
+        reason = "Balanced solar and wind potential supports mixed generation"
+
+    confidence = round(clamp((overall_score * 0.7) + (max(solar_score, wind_score) * 0.3)))
+    return DeploymentRecommendation(recommendation=recommendation, reason=reason, confidence=confidence)
+
+
+def analyze_site_suitability(payload: SuitabilityAnalyzeRequest) -> SuitabilityAnalyzeResponse:
+    environmental = merge_environmental_data(payload.latitude, payload.longitude, payload.environmental_data)
+    solar_score = score_solar(environmental)
+    wind_score = score_wind(environmental)
+    overall_score = round(clamp((solar_score * 0.54) + (wind_score * 0.36) + ((100 - scale(environmental.land_slope, 8, 18)) * 0.10)))
+    category = get_category(overall_score)
+    recommendation = recommend_deployment(solar_score, wind_score, overall_score)
+
+    response = SuitabilityAnalyzeResponse(
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        overall_score=overall_score,
+        solar_score=solar_score,
+        wind_score=wind_score,
+        category=category,
+        recommendation=recommendation,
+        environmental_summary=environmental,
+    )
+
+    RECENT_ANALYSES.insert(0, response.model_dump())
+    del RECENT_ANALYSES[10:]
+    return response
+
+
+def get_recent_analyses() -> list[dict]:
+    if RECENT_ANALYSES:
+        return RECENT_ANALYSES
+
+    samples = [
+        SuitabilityAnalyzeRequest(latitude=23.2599, longitude=77.4126),
+        SuitabilityAnalyzeRequest(latitude=15.2993, longitude=74.1240),
+        SuitabilityAnalyzeRequest(latitude=26.9124, longitude=75.7873),
+    ]
+    for sample in samples:
+        analyze_site_suitability(sample)
+    return RECENT_ANALYSES
